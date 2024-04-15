@@ -1,9 +1,20 @@
 import http from 'k6/http';
-import {check} from 'k6';
-import {Rate} from 'k6/metrics';
+import { check, sleep } from 'k6';
+import { Rate, Trend } from 'k6/metrics';
 import crypto from 'k6/crypto';
+import { uuidv4 } from 'https://jslib.k6.io/k6-utils/1.4.0/index.js';
+import encoding from 'k6/encoding';
 
-export let errorRate = new Rate('errors');
+export let encryptErrors = new Rate('encrypt_errors');
+export let decryptErrors = new Rate('decrypt_errors');
+export let encryptDecryptErrors = new Rate('encrypt_decrypt_errors');
+export let encryptTimeouts = new Rate('encrypt_timeouts');
+export let decryptTimeouts = new Rate('decrypt_timeouts');
+export let encryptTime = new Trend("encrypt_time")
+export let decryptTime = new Trend("decrypt_time")
+
+const sleepDuration = __ENV.SLEEP_DURATION ? Number(__ENV.SLEEP_DURATION) / 1000 : null;
+
 
 // To disable the certificate verification
 export const options = {
@@ -44,7 +55,7 @@ function getSigningKey(key, datestamp, region, service) {
 }
 
 /* Funciton to generate the signed header for hyok crypto operations*/
-function generateHeader(dict) {
+function generateHeader(dict, op) {
     var algorithm = 'AWS4-HMAC-SHA256'
     var xks_service = 'kms-xks-proxy'
     var request_type = 'aws4_request'
@@ -68,9 +79,9 @@ function generateHeader(dict) {
      */
     const hyok_date = year.toString() + (month < 10 ? '0' : '') + (month + 1).toString() + (date < 10 ? `0${date}` : date.toString()) + "T" + (hour < 10 ? `0${hour}` : hour.toString()) + (mins < 10 ? `0${mins}` : mins.toString()) + (sec < 10 ? `0${sec}` : sec.toString()) + "Z"
     var hyok_date_stamp = year.toString() + (month < 10 ? '0' : '') + (month + 1).toString() + (date < 10 ? `0${date}` : date.toString())
-    var headers_to_sign = {'host': dict["kylo"], 'x-amz-date': hyok_date}
+    var headers_to_sign = { 'host': dict["kylo"], 'x-amz-date': hyok_date }
 
-    var crypto_url = dict["xks_proxy_uri"] + "/keys/" + dict["hyok_key_id"] + "/encrypt"
+    var crypto_url = dict["xks_proxy_uri"] + "/keys/" + dict["hyok_key_id"] + "/" + op
     var canonical_headers = ""
 
     for (var header in headers_to_sign) {
@@ -104,20 +115,17 @@ function generateHeader(dict) {
     return aws_hyok_header
 }
 
-export default function () {
+function encrypt(plain_text, aad_data) {
     var aws_acc_id = __ENV.AWS_ACCOUNT_ID
     var aws_user = "Alice"
     var aws_region = __ENV.AWS_REGION
     var aws_key_id = "1234abcd-12ab-34cd-56ef-1234567890ab"
-    var aad_data = "cHJvamVjdD1uaWxlLGRlcGFydG1lbnQ9bWFya2V0aW5n"
-    var plain_text = "SGVsbG8gV29ybGQh"
-
     var payload = `{
         "requestMetadata": {
             "awsPrincipalArn": "arn:aws:iam::${aws_acc_id}:user/${aws_user}",
             "kmsKeyArn": "arn:aws:kms:${aws_region}:${aws_acc_id}:/key/${aws_key_id}",
             "kmsOperation": "Encrypt",
-            "kmsRequestId": "4112f4d6-db54-4af4-ae30-c55a22a8dfae",
+            "kmsRequestId": "${uuidv4()}",
             "kmsViaService": "ebs"
         },
         "additionalAuthenticatedData": "${aad_data}",
@@ -135,7 +143,7 @@ export default function () {
     }
 
     var url = `https://${__ENV.CM_URL}/api/v1/cckm/aws/xks-proxy-endpoints/${__ENV.CKS_ID}/kms/xks/v1/keys/${__ENV.HYOK_KEY_ID}/encrypt`
-    var header_dict = generateHeader(hyok_dict)
+    var header_dict = generateHeader(hyok_dict, "encrypt")
     var params = {
         headers: {
             'Content-Type': 'application/json',
@@ -144,11 +152,87 @@ export default function () {
         },
     }
     let res = http.post(url, payload, params)
-    const result = check(res, {
-        //'response time': (r) => r.timings.duration <= 500,
+    return res
+}
+
+function decrypt(ciphertext, aad_data, iv, tag, metadata) {
+    var aws_acc_id = __ENV.AWS_ACCOUNT_ID
+    var aws_user = "Alice"
+    var aws_region = __ENV.AWS_REGION
+    var aws_key_id = "1234abcd-12ab-34cd-56ef-1234567890ab"
+    var payload = `{
+        "requestMetadata": {
+            "awsPrincipalArn": "arn:aws:iam::${aws_acc_id}:user/${aws_user}",
+            "kmsKeyArn": "arn:aws:kms:${aws_region}:${aws_acc_id}:/key/${aws_key_id}",
+            "kmsOperation": "Decrypt",
+            "kmsRequestId": "${uuidv4()}",
+            "kmsViaService": "ebs"
+        },
+        "additionalAuthenticatedData": "${aad_data}",
+        "ciphertext": "${ciphertext}",
+        "initializationVector": "${iv}",
+        "authenticationTag": "${tag}",
+        "ciphertextMetadata": "${metadata}",
+        "encryptionAlgorithm": "AES_GCM"
+    }`
+
+    let hyok_dict = {
+        "kylo": __ENV.CM_URL,
+        'xks_proxy_uri': `/api/v1/cckm/aws/xks-proxy-endpoints/${__ENV.CKS_ID}/kms/xks/v1`,
+        'hyok_key_id': __ENV.HYOK_KEY_ID,
+        "payload": payload,
+        "cks_access_secret_key": __ENV.CKS_SECRET_KEY,
+        "cks_access_id": __ENV.CKS_ACCESS_ID,
+    }
+
+    var url = `https://${__ENV.CM_URL}/api/v1/cckm/aws/xks-proxy-endpoints/${__ENV.CKS_ID}/kms/xks/v1/keys/${__ENV.HYOK_KEY_ID}/decrypt`
+    var header_dict = generateHeader(hyok_dict, "decrypt")
+    var params = {
+        headers: {
+            'Content-Type': 'application/json',
+            'X-Amz-Date': header_dict['X-Amz-Date'],
+            'Authorization': header_dict['Authorization']
+        },
+    }
+    let res = http.post(url, payload, params)
+    return res
+}
+
+export default function () {
+    const aadBytes = crypto.randomBytes(32);
+    const aadData = encoding.b64encode(aadBytes);
+    const randomBytes = crypto.randomBytes(32);
+    const plaintext = encoding.b64encode(randomBytes);
+    const encrypt_res = encrypt(plaintext, aadData)
+    encryptErrors.add(!check(encrypt_res, {
         'status code': (r) => r.status === 200,
-    });
-    errorRate.add(!result)
+    }))
+    encryptTimeouts.add(!check(encrypt_res, {
+        'response time': (r) => r.timings.duration <= 250,
+    }))
+    encryptTime.add(encrypt_res.timings.duration)
+    const body = JSON.parse(encrypt_res.body)
+    const decrypt_res = decrypt(
+        body.ciphertext,
+        aadData,
+        body.initializationVector,
+        body.authenticationTag,
+        body.ciphertextMetadata,
+    )
+    if (sleepDuration != null) {
+        sleep(sleepDuration)
+    }
+    decryptErrors.add(!check(decrypt_res, {
+        'status code': (r) => r.status === 200,
+    }))
+    decryptTimeouts.add(!check(decrypt_res, {
+        'response time': (r) => r.timings.duration <= 250,
+    }))
+    encryptDecryptErrors.add(!check(decrypt_res, {
+        'correctness': (r) => JSON.parse(decrypt_res.body).plaintext == plaintext,
+    }))
+    decryptTime.add(decrypt_res.timings.duration)
+    if (sleepDuration != null) {
+        sleep(sleepDuration)
+    }
 };
-
-
